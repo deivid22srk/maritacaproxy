@@ -57,12 +57,71 @@ func New(cfg Config, mgr *account.Manager) (*Creator, error) {
         if err != nil {
                 return nil, fmt.Errorf("tempmail provider: %w", err)
         }
+
+        // Preflight: check that playwright + chromium are available when auto-create is enabled.
+        // We don't fail here (caller may not need autocreate), but warn loudly.
+        if err := preflightPlaywright(cfg.ChromePath); err != nil {
+                logger.Warn("[autocreate] Preflight check failed: %v", err)
+                logger.Warn("[autocreate] Install with: pip install playwright && playwright install chromium")
+                logger.Warn("[autocreate] Or set CHROME_PATH to an existing Chrome/Chromium binary")
+        }
+
         return &Creator{
                 cfg:      cfg,
                 mgr:      mgr,
                 auth:     auth.New(cfg.Auth0Config),
                 tempMail: provider,
         }, nil
+}
+
+// preflightPlaywright checks that Python+Playwright and a Chromium binary are
+// available. Returns an error describing what's missing.
+func preflightPlaywright(chromePath string) error {
+        // 1. Check python3 is on PATH
+        if _, err := exec.LookPath("python3"); err != nil {
+                return fmt.Errorf("python3 not found on PATH (install Python 3.10+ and `pip install playwright`)")
+        }
+        // 2. Check playwright module is importable
+        cmd := exec.Command("python3", "-c", "import playwright; print(playwright.__file__)")
+        if err := cmd.Run(); err != nil {
+                return fmt.Errorf("python playwright module not installed (run: pip install playwright && playwright install chromium)")
+        }
+        // 3. Check Chromium binary
+        candidates := []string{}
+        if chromePath != "" {
+                candidates = append(candidates, chromePath)
+        }
+        // Add common locations
+        candidates = append(candidates,
+                "/home/z/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome",
+                "/home/z/.cache/ms-playwright/chromium-1200/chrome-linux64/chrome",
+                "/root/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome",
+                "/root/.cache/ms-playwright/chromium-1200/chrome-linux64/chrome",
+                "/usr/bin/google-chrome",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+        )
+        found := ""
+        for _, p := range candidates {
+                if _, err := os.Stat(p); err == nil {
+                        found = p
+                        break
+                }
+        }
+        if found == "" {
+                // Last resort: try `which` for chromium/chrome
+                for _, name := range []string{"chromium", "chromium-browser", "google-chrome", "chrome"} {
+                        if p, err := exec.LookPath(name); err == nil {
+                                found = p
+                                break
+                        }
+                }
+        }
+        if found == "" {
+                return fmt.Errorf("no Chromium/Chrome binary found (run: playwright install chromium, or set CHROME_PATH)")
+        }
+        logger.Info("[autocreate] Preflight OK: chromium=%s", found)
+        return nil
 }
 
 // CreateOne creates one new account end-to-end and stores it in the manager.
@@ -89,24 +148,32 @@ func (c *Creator) CreateOne(ctx context.Context) (*account.Account, error) {
 
         // Step 3: Wait for verification email if needed
         if !emailVerified {
-                logger.Info("[autocreate] Waiting for verification email...")
+                logger.Info("[autocreate] Waiting for verification email (timeout 3min)...")
                 // Trigger resend to ensure email is sent
-                _ = c.auth.ResendVerification(email)
+                if err := c.auth.ResendVerification(email); err != nil {
+                        logger.Warn("[autocreate] Resend verification failed (non-fatal): %v", err)
+                }
 
                 timeout := time.Duration(c.cfg.VerifyMaxAttempts*c.cfg.VerifyInterval) * time.Second
                 if timeout == 0 {
+                        timeout = 3 * time.Minute
+                }
+                // Hard cap at 5 minutes so we don't hang forever
+                if timeout > 5*time.Minute {
                         timeout = 5 * time.Minute
                 }
+                logger.Info("[autocreate] Polling mailbox for up to %v...", timeout)
                 verifyURL, err := c.tempMail.WaitForVerification(email, mailboxPass, timeout)
                 if err != nil {
-                        return nil, fmt.Errorf("wait verification: %w", err)
+                        return nil, fmt.Errorf("wait verification email (check that TEMPMAIL_PROVIDER=%q is reachable): %w",
+                                c.cfg.TempMailProvider, err)
                 }
                 logger.Info("[autocreate] Got verification URL/code: %s", verifyURL)
 
                 // Step 4: If it's a URL, visit it via headless browser to complete verification
                 if strings.HasPrefix(verifyURL, "http") {
                         if err := c.visitVerificationURL(ctx, verifyURL); err != nil {
-                                return nil, fmt.Errorf("verify email: %w", err)
+                                return nil, fmt.Errorf("verify email (browser step - check that Playwright+Chromium are installed): %w", err)
                         }
                         logger.Info("[autocreate] Email verification completed")
                 }
