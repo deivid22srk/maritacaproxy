@@ -1,0 +1,40 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+
+# Data (accounts database - sensitive!)
+data/
+*.db.json
+*.db
+.enc_key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+
+# Logs
+*.log
+
+# Profiles
+maritaca_profiles/
+
+# Python
+__pycache__/
+*.pyc
