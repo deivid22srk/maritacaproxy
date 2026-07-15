@@ -432,17 +432,7 @@ func (p *StreamingToolParser) parseToolCall(parsed interface{}) *ParsedToolCall 
                 }
         }
 
-        name := getStringOr(obj, "name", "")
-        if fn, ok := obj["function"].(map[string]interface{}); ok && name == "" {
-                name, _ = fn["name"].(string)
-        }
-        if name == "" {
-                name = getStringOr(obj, "tool_name", getStringOr(obj, "tool", ""))
-        }
-        if name == "" {
-                return nil
-        }
-
+        // Extract arguments FIRST so we can use them for name inference
         var args interface{}
         if a, ok := obj["arguments"]; ok {
                 args = a
@@ -457,6 +447,32 @@ func (p *StreamingToolParser) parseToolCall(parsed interface{}) *ParsedToolCall 
         } else if a, ok := obj["input"]; ok {
                 args = a
         }
+        argsMap := parseToolArguments(args)
+
+        // Now extract the name
+        name := getStringOr(obj, "name", "")
+        if fn, ok := obj["function"].(map[string]interface{}); ok && name == "" {
+                name, _ = fn["name"].(string)
+        }
+        if name == "" {
+                name = getStringOr(obj, "tool_name", getStringOr(obj, "tool", ""))
+        }
+        // If still no name, try inferring from the arguments using the tool definitions
+        if name == "" && len(argsMap) > 0 && len(p.tools) > 0 {
+                inferred := inferToolNameFromParameters(argsMap, p.tools)
+                if inferred != "" {
+                        logger.Debug("[parser] Inferred tool name '%s' from arguments %v", inferred, argsMap)
+                        name = inferred
+                }
+        }
+        // Last resort: if there's only one tool defined, use it
+        if name == "" && len(p.tools) == 1 {
+                name = p.tools[0].Function.Name
+                logger.Debug("[parser] Only one tool defined, using '%s'", name)
+        }
+        if name == "" {
+                return nil
+        }
 
         id := getStringOr(obj, "id", getStringOr(obj, "tool_call_id", ""))
         if id == "" {
@@ -466,7 +482,7 @@ func (p *StreamingToolParser) parseToolCall(parsed interface{}) *ParsedToolCall 
         return &ParsedToolCall{
                 ID:        id,
                 Name:      name,
-                Arguments: parseToolArguments(args),
+                Arguments: argsMap,
         }
 }
 
