@@ -49,7 +49,11 @@ func (c *Client) CreateChat(accessToken string) (string, error) {
         defer resp.Body.Close()
         body, _ := io.ReadAll(resp.Body)
         if resp.StatusCode >= 400 {
-                return "", fmt.Errorf("create chat failed (%d): %s", resp.StatusCode, string(body))
+                return "", &APIError{
+                        StatusCode: resp.StatusCode,
+                        Body:       string(body),
+                        Message:    fmt.Sprintf("create chat failed (%d): %s", resp.StatusCode, string(body)),
+                }
         }
 
         var data struct {
@@ -134,10 +138,47 @@ func (c *Client) SendMessage(accessToken string, msg MessageRequest, events Stre
 
         if resp.StatusCode >= 400 {
                 body, _ := io.ReadAll(resp.Body)
-                return fmt.Errorf("send message failed (%d): %s", resp.StatusCode, string(body))
+                return &APIError{
+                        StatusCode: resp.StatusCode,
+                        Body:       string(body),
+                        Message:    fmt.Sprintf("send message failed (%d): %s", resp.StatusCode, string(body)),
+                }
         }
 
         return parseSSEStream(resp.Body, events)
+}
+
+// APIError wraps an HTTP error response from the Maritaca API.
+type APIError struct {
+        StatusCode int
+        Body       string
+        Message    string
+}
+
+func (e *APIError) Error() string { return e.Message }
+
+// IsQuotaExceeded returns true if the error is a 402 quota-exceeded error
+// (Maritaca returns this when the free-tier message limit is hit).
+func IsQuotaExceeded(err error) bool {
+        if err == nil {
+                return false
+        }
+        if apiErr, ok := err.(*APIError); ok {
+                if apiErr.StatusCode == 402 {
+                        return true
+                }
+                // Also check the body for quota-related keywords (defensive)
+                lower := strings.ToLower(apiErr.Body)
+                return strings.Contains(lower, "limite de mensagens") ||
+                        strings.Contains(lower, "quota") ||
+                        strings.Contains(lower, "excedeu") ||
+                        strings.Contains(lower, "free")
+        }
+        // Fallback: string match on any error
+        lower := strings.ToLower(err.Error())
+        return strings.Contains(lower, "(402)") ||
+                strings.Contains(lower, "limite de mensagens") ||
+                strings.Contains(lower, "quota")
 }
 
 // parseSSEStream reads an SSE stream line by line and dispatches events.

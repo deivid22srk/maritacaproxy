@@ -4,6 +4,7 @@
 package api
 
 import (
+        "context"
         "encoding/json"
         "fmt"
         "net/http"
@@ -25,6 +26,13 @@ type Server struct {
         auth        *auth.Authenticator
         apiKey      string
         maritacaURL string
+        autoCreator AutoCreator
+}
+
+// AutoCreator is the interface implemented by the autocreate.Creator.
+// We use an interface so the server can work without autocreate enabled.
+type AutoCreator interface {
+        CreateOne(ctx context.Context) (*account.Account, error)
 }
 
 // NewServer constructs a new API server.
@@ -38,17 +46,31 @@ func NewServer(mgr *account.Manager, maritacaURL, apiKey string, authCfg auth.Co
         }
 }
 
+// SetAutoCreator injects an autocreate.Creator for on-demand account creation.
+func (s *Server) SetAutoCreator(c AutoCreator) {
+        s.autoCreator = c
+}
+
 // RegisterRoutes mounts all API routes on the provided mux.
+// Note: /v1/accounts/create is intentionally NOT registered here so that
+// main.go can override it with the autocreate-enabled version when
+// AUTO_ACCOUNT_ENABLED=true. If autocreate is disabled, the default
+// (not-implemented) handler is registered via RegisterDefaultAccountsCreate.
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
         mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
         mux.HandleFunc("/v1/chat/completions/stop", s.handleChatStop)
         mux.HandleFunc("/v1/models", s.handleModels)
         mux.HandleFunc("/v1/models/", s.handleModel)
         mux.HandleFunc("/v1/accounts", s.handleAccounts)
-        mux.HandleFunc("/v1/accounts/create", s.handleAccountsCreate)
         mux.HandleFunc("/v1/accounts/", s.handleAccountAction)
         mux.HandleFunc("/health", s.handleHealth)
         mux.HandleFunc("/", s.handleRoot)
+}
+
+// RegisterDefaultAccountsCreate registers the default (no-op) accounts/create
+// handler. Called by main.go when AUTO_ACCOUNT_ENABLED=false.
+func (s *Server) RegisterDefaultAccountsCreate(mux *http.ServeMux) {
+        mux.HandleFunc("/v1/accounts/create", s.handleAccountsCreate)
 }
 
 // AuthMiddleware wraps the handler with API key authentication.
@@ -208,45 +230,95 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
         // Build the final prompt from messages
         prompt, hasTools, toolChoiceMode, _, candidateTools, isThinking := s.buildPrompt(&req)
 
-        // Get an available account
-        acc := s.mgr.GetNextAvailable(nil)
-        if acc == nil {
+        // Try up to 3 accounts. If an account hits quota (402), mark it on cooldown
+        // and rotate to the next. If no other account is available and auto-create
+        // is enabled, create a new account on-demand.
+        maxAttempts := 3
+        var acc *account.Account
+        var chatID string
+        triedIDs := map[string]bool{}
+
+        for attempt := 1; attempt <= maxAttempts; attempt++ {
+                // Get next available account (excluding ones we've already tried)
+                acc = s.mgr.GetNextAvailable(triedIDs)
+                if acc == nil {
+                        // No available accounts - try auto-create if enabled.
+                        // Use background context (NOT r.Context()) so the Playwright process
+                        // isn't killed when the HTTP client times out or disconnects.
+                        if s.autoCreator != nil {
+                                logger.Info("[chat] No accounts available - auto-creating one (attempt %d/%d, background ctx)", attempt, maxAttempts)
+                                ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+                                newAcc, err := s.autoCreator.CreateOne(ctx)
+                                cancel()
+                                if err != nil {
+                                        logger.Error("[chat] Auto-create failed: %v", err)
+                                        writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+                                                "error": map[string]string{"message": fmt.Sprintf("no accounts available and auto-create failed: %v", err)},
+                                        })
+                                        return
+                                }
+                                acc = newAcc
+                                logger.Info("[chat] Auto-created new account: %s (id=%s)", acc.Email, acc.ID)
+                        } else {
+                                writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+                                        "error": map[string]string{"message": "No available accounts. Add accounts via POST /v1/accounts/create or set AUTO_ACCOUNT_ENABLED=true."},
+                                })
+                                return
+                        }
+                }
+
+                triedIDs[acc.ID] = true
+                logger.Info("[chat] Attempt %d/%d: routing to account %s (id=%s)", attempt, maxAttempts, acc.Email, acc.ID)
+                s.mgr.MarkInUse(acc.ID)
+
+                // Refresh token if needed
+                if acc.IsTokenExpired() && acc.RefreshToken != "" {
+                        logger.Info("[chat] Refreshing token for %s", acc.Email)
+                        tokens, err := s.auth.RefreshToken(acc.RefreshToken)
+                        if err != nil {
+                                logger.Error("[chat] Token refresh failed: %v", err)
+                                s.mgr.MarkCooldown(acc.ID, 5*time.Minute, "token-refresh-failed")
+                                s.mgr.ReleaseInUse(acc.ID)
+                                continue
+                        }
+                        if err := s.mgr.UpdateTokens(acc.ID, tokens.AccessToken, tokens.RefreshToken, tokens.ExpiresIn); err != nil {
+                                logger.Warn("[chat] Failed to persist refreshed token: %v", err)
+                        }
+                        acc.AccessToken = tokens.AccessToken
+                        acc.RefreshToken = tokens.RefreshToken
+                        acc.TokenExpiry = time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second)
+                }
+
+                // Create chat session
+                cid, err := s.maritaca.CreateChat(acc.AccessToken)
+                if err != nil {
+                        logger.Error("[chat] CreateChat failed for %s: %v", acc.Email, err)
+                        if maritaca.IsQuotaExceeded(err) {
+                                // Quota exceeded - long cooldown (6h, matches Maritaca's reset window)
+                                s.mgr.MarkCooldown(acc.ID, 6*time.Hour, "quota-exceeded")
+                                s.mgr.ReleaseInUse(acc.ID)
+                                logger.Warn("[chat] Account %s hit quota limit, rotating...", acc.Email)
+                                continue
+                        }
+                        // Other errors - short cooldown
+                        s.mgr.MarkCooldown(acc.ID, 1*time.Minute, "create-chat-failed")
+                        s.mgr.ReleaseInUse(acc.ID)
+                        continue
+                }
+                chatID = cid
+                logger.Info("[chat] Created chat session: %s", chatID)
+                break
+        }
+
+        if acc == nil || chatID == "" {
                 writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-                        "error": map[string]string{"message": "No available accounts. Add accounts via POST /v1/accounts/create or set AUTO_ACCOUNT_ENABLED=true."},
+                        "error": map[string]string{"message": "All accounts exhausted or quota-exceeded. Try again later or add more accounts."},
                 })
                 return
         }
-        logger.Info("[chat] Routing request to account %s (id=%s)", acc.Email, acc.ID)
-        s.mgr.MarkInUse(acc.ID)
+
+        // Release in-use when the response is done (deferred)
         defer s.mgr.ReleaseInUse(acc.ID)
-
-        // Refresh token if needed
-        if acc.IsTokenExpired() && acc.RefreshToken != "" {
-                logger.Info("[chat] Refreshing token for %s", acc.Email)
-                tokens, err := s.auth.RefreshToken(acc.RefreshToken)
-                if err != nil {
-                        logger.Error("[chat] Token refresh failed: %v", err)
-                        s.mgr.MarkCooldown(acc.ID, 5*time.Minute, "token-refresh-failed")
-                        writeJSON(w, http.StatusBadGateway, map[string]interface{}{"error": map[string]string{"message": "token refresh failed: " + err.Error()}})
-                        return
-                }
-                if err := s.mgr.UpdateTokens(acc.ID, tokens.AccessToken, tokens.RefreshToken, tokens.ExpiresIn); err != nil {
-                        logger.Warn("[chat] Failed to persist refreshed token: %v", err)
-                }
-                acc.AccessToken = tokens.AccessToken
-                acc.RefreshToken = tokens.RefreshToken
-                acc.TokenExpiry = time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second)
-        }
-
-        // Create chat session
-        chatID, err := s.maritaca.CreateChat(acc.AccessToken)
-        if err != nil {
-                logger.Error("[chat] CreateChat failed: %v", err)
-                s.mgr.MarkCooldown(acc.ID, 1*time.Minute, "create-chat-failed")
-                writeJSON(w, http.StatusBadGateway, map[string]interface{}{"error": map[string]string{"message": "failed to create chat: " + err.Error()}})
-                return
-        }
-        logger.Info("[chat] Created chat session: %s", chatID)
 
         // Build message request
         msgReq := maritaca.MessageRequest{
@@ -646,6 +718,12 @@ func (s *Server) handleStreamChat(
 
         if err := s.maritaca.SendMessage(acc.AccessToken, msgReq, events); err != nil {
                 logger.Error("[chat] SendMessage failed: %v", err)
+                // If this is a quota-exceeded error, mark account on cooldown so
+                // the next request will pick a different account (or auto-create one).
+                if maritaca.IsQuotaExceeded(err) {
+                        s.mgr.MarkCooldown(acc.ID, 6*time.Hour, "quota-exceeded-stream")
+                        logger.Warn("[chat] Account %s hit quota limit during stream - marked for 6h cooldown", acc.Email)
+                }
                 writeEvent(map[string]interface{}{
                         "id":      completionID,
                         "object":  "chat.completion.chunk",
@@ -790,6 +868,11 @@ func (s *Server) handleNonStreamChat(
 
         if err := s.maritaca.SendMessage(acc.AccessToken, msgReq, events); err != nil {
                 logger.Error("[chat] SendMessage failed: %v", err)
+                // Mark quota-exceeded accounts for 6h cooldown so next request rotates
+                if maritaca.IsQuotaExceeded(err) {
+                        s.mgr.MarkCooldown(acc.ID, 6*time.Hour, "quota-exceeded-nonstream")
+                        logger.Warn("[chat] Account %s hit quota limit - marked for 6h cooldown", acc.Email)
+                }
                 writeJSON(w, http.StatusBadGateway, map[string]interface{}{"error": map[string]string{"message": err.Error()}})
                 return
         }

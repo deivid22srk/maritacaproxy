@@ -88,7 +88,8 @@ func main() {
         mux := http.NewServeMux()
         srv.RegisterRoutes(mux)
 
-        // Override the /v1/accounts/create endpoint with the autocreate-enabled version
+        // Register /v1/accounts/create - either with autocreate-enabled handler
+        // or the default (not-implemented) handler.
         if cfg.AutoAcc.Enabled {
                 creator, err := autocreate.NewCreator(autocreate.AutoCreateConfig{
                         Headless:          cfg.AutoAcc.Headless,
@@ -104,6 +105,10 @@ func main() {
                 if err != nil {
                         logger.Error("[main] Failed to init autocreate: %v", err)
                 } else {
+                        // Inject creator so the chat handler can auto-create accounts on quota-exceeded
+                        srv.SetAutoCreator(creator)
+                        logger.Info("[main] Auto account creation enabled (on-demand + POST /v1/accounts/create)")
+
                         mux.HandleFunc("/v1/accounts/create", func(w http.ResponseWriter, r *http.Request) {
                                 if r.Method != http.MethodPost {
                                         w.WriteHeader(http.StatusMethodNotAllowed)
@@ -135,6 +140,9 @@ func main() {
                         })
                         logger.Info("[main] Auto account creation enabled at /v1/accounts/create")
                 }
+        } else {
+                // Register default (not-implemented) handler so the route exists
+                srv.RegisterDefaultAccountsCreate(mux)
         }
 
         // Wrap with auth middleware if API key is set
