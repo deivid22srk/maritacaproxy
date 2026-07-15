@@ -19,6 +19,7 @@ import (
         "github.com/deivid22srk/maritacaproxy/internal/autocreate"
         "github.com/deivid22srk/maritacaproxy/internal/config"
         "github.com/deivid22srk/maritacaproxy/internal/logger"
+        "github.com/deivid22srk/maritacaproxy/internal/tools"
 )
 
 func main() {
@@ -36,6 +37,10 @@ func main() {
                 os.Exit(1)
         }
         logger.Info("[main] %s", cfg.String())
+
+        // Configure the tool-call tag name (must be done before any parser is constructed)
+        tools.SetTagName(cfg.Tools.TagName)
+        logger.Info("[main] Tool-call tag: <%s>", cfg.Tools.TagName)
 
         mgr, err := account.NewManager("./data/maritacaproxy.db.json")
         if err != nil {

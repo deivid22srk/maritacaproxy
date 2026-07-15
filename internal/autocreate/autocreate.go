@@ -148,23 +148,27 @@ func (c *Creator) CreateOne(ctx context.Context) (*account.Account, error) {
 
         // Step 3: Wait for verification email if needed
         if !emailVerified {
-                // Trigger resend to ensure email is sent
-                if err := c.auth.ResendVerification(email); err != nil {
-                        logger.Warn("[autocreate] Resend verification failed (non-fatal): %v", err)
-                }
+                // Give the backend a moment to propagate the new user before triggering resend
+                time.Sleep(2 * time.Second)
 
                 timeout := time.Duration(c.cfg.VerifyMaxAttempts*c.cfg.VerifyInterval) * time.Second
                 if timeout == 0 {
                         timeout = 3 * time.Minute
                 }
-                // Hard cap at 5 minutes so we don't hang forever
-                if timeout > 5*time.Minute {
-                        timeout = 5 * time.Minute
+                // Hard cap at 6 minutes so we don't hang forever (allows ~12 resend attempts at 30s)
+                if timeout > 6*time.Minute {
+                        timeout = 6 * time.Minute
                 }
-                logger.Info("[autocreate] Waiting for verification email (timeout %v, provider=%s)...", timeout, c.cfg.TempMailProvider)
-                verifyURL, err := c.tempMail.WaitForVerification(email, mailboxPass, timeout)
+                logger.Info("[autocreate] Waiting for verification email (timeout %v, provider=%s, resending every 30s)...", timeout, c.cfg.TempMailProvider)
+
+                // Resend callback - re-triggers Maritaca's /api/auth/resend-verification
+                resendFn := func() error {
+                        return c.auth.ResendVerification(email)
+                }
+
+                verifyURL, err := c.tempMail.WaitForVerificationWithResend(email, mailboxPass, timeout, resendFn, 30*time.Second)
                 if err != nil {
-                        return nil, fmt.Errorf("wait verification email (check that TEMPMAIL_PROVIDER=%q is reachable): %w",
+                        return nil, fmt.Errorf("wait verification email (check that TEMPMAIL_PROVIDER=%q is reachable, or try another provider): %w",
                                 c.cfg.TempMailProvider, err)
                 }
                 logger.Info("[autocreate] Got verification URL/code: %s", verifyURL)

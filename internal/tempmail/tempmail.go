@@ -23,6 +23,11 @@ type Provider interface {
         // WaitForVerification polls for an email containing a verification link/code.
         // Returns the extracted verification URL or code.
         WaitForVerification(email, password string, timeout time.Duration) (string, error)
+        // WaitForVerificationWithResend polls for an email and periodically calls
+        // the resend callback to re-trigger the verification email. This is useful
+        // when the first send may silently fail (e.g., Maritaca's backend rate-limits).
+        // resendInterval is how often to call resend (e.g., 30s). If 0, no resends.
+        WaitForVerificationWithResend(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error)
         // Close releases any provider-specific resources.
         Close() error
 }
@@ -137,6 +142,10 @@ func (m *MailTM) getDomain() (string, error) {
 }
 
 func (m *MailTM) WaitForVerification(email, password string, timeout time.Duration) (string, error) {
+        return m.WaitForVerificationWithResend(email, password, timeout, nil, 0)
+}
+
+func (m *MailTM) WaitForVerificationWithResend(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error) {
         if m.token == "" {
                 // Re-login
                 body := fmt.Sprintf(`{"address":"%s","password":"%s"}`, email, password)
@@ -157,6 +166,20 @@ func (m *MailTM) WaitForVerification(email, password string, timeout time.Durati
         pollInterval := 3 * time.Second
         processedMsgs := map[string]bool{}
         pollCount := 0
+        lastResend := time.Now()
+        resendCount := 0
+
+        // Trigger initial resend if callback provided
+        if resend != nil {
+                logger.Info("[tempmail] Triggering initial resend...")
+                if err := resend(); err != nil {
+                        logger.Warn("[tempmail] Initial resend failed: %v", err)
+                } else {
+                        logger.Info("[tempmail] Initial resend OK")
+                }
+                lastResend = time.Now()
+                resendCount++
+        }
 
         for time.Now().Before(deadline) {
                 pollCount++
@@ -224,9 +247,22 @@ func (m *MailTM) WaitForVerification(email, password string, timeout time.Durati
                                 logger.Warn("[tempmail] Email found but no verification URL/OTP extracted")
                         }
                 }
+
+                // Periodically re-trigger resend if no email yet (Maritaca sometimes silently drops the first send)
+                if resend != nil && resendInterval > 0 && time.Since(lastResend) >= resendInterval {
+                        resendCount++
+                        logger.Info("[tempmail] No email after %v - triggering resend #%d...", time.Since(lastResend).Round(time.Second), resendCount)
+                        if err := resend(); err != nil {
+                                logger.Warn("[tempmail] Resend #%d failed: %v", resendCount, err)
+                        } else {
+                                logger.Info("[tempmail] Resend #%d OK", resendCount)
+                        }
+                        lastResend = time.Now()
+                }
+
                 time.Sleep(pollInterval)
         }
-        return "", fmt.Errorf("timeout waiting for verification email on %s", email)
+        return "", fmt.Errorf("timeout waiting for verification email on %s after %d polls (%d resends)", email, pollCount, resendCount)
 }
 
 func (m *MailTM) Close() error { return nil }
@@ -265,6 +301,14 @@ func (m *OneSecMail) CreateMailbox() (string, string, error) {
 }
 
 func (m *OneSecMail) WaitForVerification(email, password string, timeout time.Duration) (string, error) {
+        return m.waitForVerificationImpl(email, password, timeout, nil, 0)
+}
+
+func (m *OneSecMail) WaitForVerificationWithResend(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error) {
+        return m.waitForVerificationImpl(email, password, timeout, resend, resendInterval)
+}
+
+func (m *OneSecMail) waitForVerificationImpl(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error) {
         parts := strings.SplitN(email, "@", 2)
         if len(parts) != 2 {
                 return "", fmt.Errorf("invalid email format: %s", email)
@@ -367,6 +411,14 @@ func (m *GuerrillaMail) CreateMailbox() (string, string, error) {
 }
 
 func (m *GuerrillaMail) WaitForVerification(email, password string, timeout time.Duration) (string, error) {
+        return m.waitForVerificationImpl(email, password, timeout, nil, 0)
+}
+
+func (m *GuerrillaMail) WaitForVerificationWithResend(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error) {
+        return m.waitForVerificationImpl(email, password, timeout, resend, resendInterval)
+}
+
+func (m *GuerrillaMail) waitForVerificationImpl(email, password string, timeout time.Duration, resend func() error, resendInterval time.Duration) (string, error) {
         deadline := time.Now().Add(timeout)
         for time.Now().Before(deadline) {
                 url := fmt.Sprintf("https://api.guerrillamail.com/ajax.php?f=get_email_list&offset=0&sid_token=%s", m.sid)

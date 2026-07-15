@@ -18,6 +18,17 @@ type Config struct {
         AutoAcc   AutoAccountConfig
         Cache     CacheConfig
         Timeouts  TimeoutConfig
+        Tools     ToolsConfig
+}
+
+// ToolsConfig holds tool-call related configuration.
+type ToolsConfig struct {
+        // TagName is the XML-like tag used to wrap tool calls in the model output.
+        // Default is "proxy_tool_call" because Maritaca's backend intercepts the
+        // standard <tool_call> tag and rejects user-provided tool names.
+        // Change to "tool_call" for Qwen-compatible behavior (only do this if the
+        // upstream model does NOT have native tool interception).
+        TagName string
 }
 
 type ServerConfig struct {
@@ -109,6 +120,9 @@ func Load() (*Config, error) {
                         HTTP:       getEnvInt("HTTP_TIMEOUT", 45000),
                         Chat:       getEnvInt("CHAT_TIMEOUT", 120000),
                         StreamIdle: getEnvInt("STREAM_IDLE_TIMEOUT", 180000),
+                },
+                Tools: ToolsConfig{
+                        TagName: getEnv("TOOL_CALL_TAG", "proxy_tool_call"),
                 },
         }
 

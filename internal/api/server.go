@@ -364,7 +364,9 @@ func (s *Server) buildPrompt(req *OpenAIRequest) (prompt string, hasTools bool, 
                                                 "name":      name,
                                                 "arguments": argsMap,
                                         })
-                                        toolCallStr := "\n<tool_call>\n" + string(payload) + "\n</tool_call>"
+                                        openTag := "<" + tools.TagName + ">"
+                                        closeTag := "</" + tools.TagName + ">"
+                                        toolCallStr := "\n" + openTag + "\n" + string(payload) + "\n" + closeTag
                                         if assistantContent != "" {
                                                 assistantContent += toolCallStr
                                         } else {
@@ -406,33 +408,36 @@ func (s *Server) buildPrompt(req *OpenAIRequest) (prompt string, hasTools bool, 
                 }
                 toolsJSON, _ := json.Marshal(formattedTools)
                 systemPrompt.WriteString(fmt.Sprintf("\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n%s\n\n", string(toolsJSON)))
-                systemPrompt.WriteString(`# TOOL CALLING FORMAT (MANDATORY)
-IMPORTANT: You do NOT have any built-in/native tools. The ONLY way to invoke a tool is by emitting a JSON object wrapped EXACTLY in <tool_call> tags as shown below. Do NOT attempt to use any platform-native tools (web_search, code_execution, data_ocean, etc.) - they are DISABLED. Use ONLY the tools listed above via the <tool_call> format.
+                openTag := "<" + tools.TagName + ">"
+                closeTag := "</" + tools.TagName + ">"
+                systemPrompt.WriteString(fmt.Sprintf(`# TOOL CALLING FORMAT (MANDATORY)
+CRITICAL: The platform you are running on has native <tool_call> tags that get INTERCEPTED by the backend. To call user-provided tools, you MUST use the custom tag %s instead. Do NOT use <tool_call> under any circumstances — it will be intercepted and rejected. Use %s / %s.
 
-To use a tool, you MUST output a JSON object wrapped EXACTLY in <tool_call> tags:
+You do NOT have any built-in/native tools (web_search, code_execution, data_ocean are all DISABLED). The ONLY way to invoke a tool is by emitting a JSON object wrapped EXACTLY in %s tags as shown below:
 
-<tool_call>
+%s
 {"name": "tool_name", "arguments": {"param_name": "value"}}
-</tool_call>
+%s
 
 EXAMPLE OF MULTIPLE TOOL CALLS:
-<tool_call>
+%s
 {"name": "read_file", "arguments": {"path": "file1.txt"}}
-</tool_call>
-<tool_call>
+%s
+%s
 {"name": "read_file", "arguments": {"path": "file2.txt"}}
-</tool_call>
+%s
 
 CRITICAL RULES:
-1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.
-2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.
-3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.
+1. ONLY use the %s/%s tags above. NEVER use <tool_call> or output raw JSON without tags.
+2. You can call multiple tools by outputting multiple %s blocks consecutively.
+3. Do NOT output any other text (explanations, chat, etc.) after your %s blocks. Wait for the user to provide the tool response.
 4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.
 5. If you need to use a tool, do it IMMEDIATELY without preamble.
-6. NEVER invent, guess, or hallucinate tool names. You MUST ONLY use the exact tool names provided in the 'TOOLS AVAILABLE' list above. Calling an unlisted tool will result in a hard execution error.
+6. NEVER invent, guess, or hallucinate tool names. You MUST ONLY use the exact tool names provided in the 'TOOLS AVAILABLE' list above.
 7. Do NOT mention that a tool failed or is unavailable. If a tool is listed, assume it works.
+8. NEVER use <tool_call> — it will be intercepted by the platform's native tool system and return "Unknown tool name" errors. Use %s / %s.
 
-`)
+`, openTag, openTag, closeTag, openTag, openTag, closeTag, openTag, closeTag, openTag, closeTag, openTag, closeTag, openTag, openTag, openTag, closeTag))
 
                 if forcedToolName != "" {
                         systemPrompt.WriteString(fmt.Sprintf("CRITICAL: You MUST call the tool \"%s\" in this response.\n\n", forcedToolName))
