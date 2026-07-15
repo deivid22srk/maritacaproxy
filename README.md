@@ -78,13 +78,42 @@ go build -o maritacaproxy ./cmd/maritacaproxy
 
 ## Configuração
 
-Crie o arquivo `.env` na raiz (veja `.env.example`):
+> **Não é obrigatório criar `.env`!** Todas as variáveis têm defaults sensatos no `internal/config/config.go`. O binário roda direto com `./maritacaproxy`.
+>
+> Você só precisa definir variáveis de ambiente quando quiser mudar um default. Existem **3 formas** de fazer isso:
+>
+> ### Forma 1: inline (recomendado pra testes rápidos)
+> ```bash
+> AUTO_ACCOUNT_ENABLED=true ./maritacaproxy -create-account -count 1
+> TEMPMAIL_PROVIDER=guerrillamail ./maritacaproxy
+> ```
+>
+> ### Forma 2: exportar no shell
+> ```bash
+> export AUTO_ACCOUNT_ENABLED=true
+> export TEMPMAIL_PROVIDER=mailtm
+> ./maritacaproxy
+> ```
+>
+> ### Forma 3: arquivo `.env` (recomendado pra deploy)
+> Crie `.env` na raiz (veja `.env.example`), mas note que **o binário não carrega `.env` automaticamente** — você precisa sourced-o antes:
+> ```bash
+> set -a; . ./.env; set +a
+> ./maritacaproxy
+> ```
+> Ou use `dotenv`:
+> ```bash
+> npm install -g dotenv-cli
+> dotenv -- ./maritacaproxy
+> ```
+
+### Variáveis suportadas (com defaults)
 
 ```env
 # Servidor
 PORT=3000
 HOST=0.0.0.0
-API_KEY=sua-chave-secreta-aqui  # opcional
+API_KEY=                          # opcional - se vazio, auth é desabilitada
 
 # Auth0 (Maritaca usa Auth0 em auth.maritaca.ai)
 AUTH0_DOMAIN=auth.maritaca.ai
@@ -99,9 +128,6 @@ MARITACA_BASE_URL=https://chat.maritaca.ai
 
 # Temporary Email Provider: mailtm | guerrillamail | 1secmail
 TEMPMAIL_PROVIDER=mailtm
-
-# Auto Account Creation
-AUTO_ACCOUNT_ENABLED=false
 AUTO_ACCOUNT_HEADLESS=true
 CHROME_PATH=                          # auto-detectado se vazio
 AUTO_ACCOUNT_PASSWORD=MaritacaProxy@2024
