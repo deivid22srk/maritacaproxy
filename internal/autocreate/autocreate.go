@@ -148,7 +148,6 @@ func (c *Creator) CreateOne(ctx context.Context) (*account.Account, error) {
 
         // Step 3: Wait for verification email if needed
         if !emailVerified {
-                logger.Info("[autocreate] Waiting for verification email (timeout 3min)...")
                 // Trigger resend to ensure email is sent
                 if err := c.auth.ResendVerification(email); err != nil {
                         logger.Warn("[autocreate] Resend verification failed (non-fatal): %v", err)
@@ -162,7 +161,7 @@ func (c *Creator) CreateOne(ctx context.Context) (*account.Account, error) {
                 if timeout > 5*time.Minute {
                         timeout = 5 * time.Minute
                 }
-                logger.Info("[autocreate] Polling mailbox for up to %v...", timeout)
+                logger.Info("[autocreate] Waiting for verification email (timeout %v, provider=%s)...", timeout, c.cfg.TempMailProvider)
                 verifyURL, err := c.tempMail.WaitForVerification(email, mailboxPass, timeout)
                 if err != nil {
                         return nil, fmt.Errorf("wait verification email (check that TEMPMAIL_PROVIDER=%q is reachable): %w",

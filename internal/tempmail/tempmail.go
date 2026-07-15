@@ -153,15 +153,19 @@ func (m *MailTM) WaitForVerification(email, password string, timeout time.Durati
         }
 
         deadline := time.Now().Add(timeout)
-        pollInterval := 5 * time.Second
+        startTime := time.Now()
+        pollInterval := 3 * time.Second
         processedMsgs := map[string]bool{}
+        pollCount := 0
 
         for time.Now().Before(deadline) {
+                pollCount++
                 req, _ := http.NewRequest("GET", "https://api.mail.tm/messages?page=1", nil)
                 req.Header.Set("Authorization", "Bearer "+m.token)
                 req.Header.Set("User-Agent", "Mozilla/5.0")
                 resp, err := m.client.Do(req)
                 if err != nil {
+                        logger.Warn("[tempmail] Poll #%d failed: %v", pollCount, err)
                         time.Sleep(pollInterval)
                         continue
                 }
@@ -178,7 +182,8 @@ func (m *MailTM) WaitForVerification(email, password string, timeout time.Durati
                 json.NewDecoder(resp.Body).Decode(&data)
                 resp.Body.Close()
 
-                logger.Debug("[tempmail] %d messages in %s", len(data.Members), email)
+                elapsed := time.Since(startTime).Round(time.Second)
+                logger.Info("[tempmail] Poll #%d (%v elapsed): %d message(s) in %s", pollCount, elapsed, len(data.Members), email)
 
                 for _, msg := range data.Members {
                         if processedMsgs[msg.ID] {
